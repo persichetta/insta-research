@@ -2,18 +2,19 @@
 """
 Instagram Political Narrative Scraper
 GitHub Actions version: scrapes posts, filters by political keywords,
-and appends new rows to a BigQuery table.
+and appends new rows to a BigQuery table using load jobs (free tier compatible).
 """
 
 import os
 import sys
-import csv
 import re
 import json
 import time
 import logging
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
 import instaloader
 from google.cloud import bigquery
@@ -40,16 +41,13 @@ PROFILES_TO_SCRAPE = [
     "babadeira",
 ]
 
-# bigquery settings
 BQ_PROJECT = os.environ.get("BQ_PROJECT", "master-research-492307")
 BQ_DATASET = os.environ.get("BQ_DATASET", "instagram_research")
 BQ_TABLE = os.environ.get("BQ_TABLE", "political_posts")
 BQ_FULL_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-# absolute floor date (never scrape before this)
 START_DATE = datetime(2026, 1, 1)
 
-# political keywords
 KEYWORDS = [
     "lula",
     "bolsonaro",
@@ -77,7 +75,6 @@ KEYWORD_PATTERN = re.compile(
 # ============================================================
 
 def caption_matches(caption: str) -> list:
-    """Return list of matched political keywords in caption."""
     if not caption:
         return []
     matches = KEYWORD_PATTERN.findall(caption)
@@ -85,7 +82,6 @@ def caption_matches(caption: str) -> list:
 
 
 def setup_instaloader() -> instaloader.Instaloader:
-    """Create instaloader instance and load session from file."""
     L = instaloader.Instaloader(
         download_video_thumbnails=False,
         download_pictures=False,
@@ -112,11 +108,10 @@ def setup_instaloader() -> instaloader.Instaloader:
 
 
 # ============================================================
-# BIGQUERY
+# BIGQUERY (load job, free tier compatible)
 # ============================================================
 
 def get_existing_shortcodes(client: bigquery.Client) -> set:
-    """Fetch all shortcodes already in BigQuery to avoid duplicates."""
     query = f"SELECT shortcode FROM `{BQ_FULL_TABLE}`"
     try:
         results = client.query(query).result()
@@ -124,53 +119,32 @@ def get_existing_shortcodes(client: bigquery.Client) -> set:
         log.info(f"found {len(codes)} existing posts in BigQuery")
         return codes
     except Exception as e:
-        # table might not exist yet on first run
         log.warning(f"could not read existing shortcodes: {e}")
         return set()
 
 
-def ensure_table_exists(client: bigquery.Client):
-    """Create the BigQuery table if it doesn't exist."""
-    schema = [
-        bigquery.SchemaField("profile", "STRING"),
-        bigquery.SchemaField("shortcode", "STRING"),
-        bigquery.SchemaField("post_url", "STRING"),
-        bigquery.SchemaField("post_date", "TIMESTAMP"),
-        bigquery.SchemaField("typename", "STRING"),
-        bigquery.SchemaField("likes", "INTEGER"),
-        bigquery.SchemaField("comments", "INTEGER"),
-        bigquery.SchemaField("video_views", "INTEGER", mode="NULLABLE"),
-        bigquery.SchemaField("is_sponsored", "BOOLEAN"),
-        bigquery.SchemaField("keywords_matched", "STRING"),
-        bigquery.SchemaField("caption", "STRING"),
-        bigquery.SchemaField("scraped_at", "TIMESTAMP"),
-    ]
-
-    table_ref = bigquery.Table(BQ_FULL_TABLE, schema=schema)
-    table_ref.time_partitioning = bigquery.TimePartitioning(
-        field="post_date",
-        type_=bigquery.TimePartitioningType.MONTH,
-    )
-
-    try:
-        client.get_table(BQ_FULL_TABLE)
-        log.info(f"table {BQ_FULL_TABLE} already exists")
-    except Exception:
-        table = client.create_table(table_ref)
-        log.info(f"created table {table.full_table_id}")
-
-
-def insert_rows(client: bigquery.Client, rows: list):
-    """Insert new rows into BigQuery."""
+def load_rows_to_bigquery(client: bigquery.Client, rows: list):
+    """Load rows using a load job (works on free tier, unlike streaming insert)."""
     if not rows:
         log.info("no new rows to insert")
         return
 
-    errors = client.insert_rows_json(BQ_FULL_TABLE, rows)
-    if errors:
-        log.error(f"BigQuery insert errors: {errors}")
-    else:
-        log.info(f"inserted {len(rows)} new rows into BigQuery")
+    # write as newline-delimited JSON to temp file
+    tmp_path = os.path.join(tempfile.gettempdir(), "bq_upload.jsonl")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+    )
+
+    with open(tmp_path, "rb") as f:
+        job = client.load_table_from_file(f, BQ_FULL_TABLE, job_config=job_config)
+
+    job.result()  # wait for completion
+    log.info(f"loaded {job.output_rows} rows into BigQuery")
 
 
 # ============================================================
@@ -179,7 +153,6 @@ def insert_rows(client: bigquery.Client, rows: list):
 
 def scrape_profile(L: instaloader.Instaloader, profile_name: str,
                    existing_shortcodes: set) -> list:
-    """Scrape one profile, return list of new post dicts."""
     log.info(f"scraping profile: {profile_name}")
 
     profile = instaloader.Profile.from_username(L.context, profile_name)
@@ -200,7 +173,6 @@ def scrape_profile(L: instaloader.Instaloader, profile_name: str,
 
         checked += 1
 
-        # skip if already in BigQuery
         if post.shortcode in existing_shortcodes:
             log.info(f"  reached already-scraped post {post.shortcode}, stopping")
             break
@@ -244,21 +216,17 @@ def main():
     log.info(f"profiles: {', '.join(PROFILES_TO_SCRAPE)}")
     log.info("=" * 50)
 
-    # setup
     L = setup_instaloader()
     client = bigquery.Client(project=BQ_PROJECT)
 
-    ensure_table_exists(client)
     existing = get_existing_shortcodes(client)
 
-    # scrape each profile
     all_new = []
     for profile_name in PROFILES_TO_SCRAPE:
         try:
             posts = scrape_profile(L, profile_name, existing)
             all_new.extend(posts)
 
-            # be nice to instagram between profiles
             if profile_name != PROFILES_TO_SCRAPE[-1]:
                 log.info("waiting 30s before next profile...")
                 time.sleep(30)
@@ -274,8 +242,8 @@ def main():
             log.error(f"unexpected error for {profile_name}: {e}")
             continue
 
-    # insert into BigQuery
-    insert_rows(client, all_new)
+    # load into BigQuery using load job (free tier compatible)
+    load_rows_to_bigquery(client, all_new)
 
     # summary
     log.info("=" * 50)
