@@ -1,0 +1,2 @@
+instaloader>=4.13
+google-cloud-bigquery>=3.20
