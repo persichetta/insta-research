@@ -1,0 +1,63 @@
+# .github/workflows/daily_scrape.yml
+#
+# Runs the Instagram political narrative scraper daily at 06:00 UTC (03:00 BRT)
+# and inserts new posts into BigQuery.
+#
+# Repo: https://github.com/persichetta/insta-research
+# BigQuery: master-research-492307.instagram_research.political_posts
+#
+# Required GitHub Secrets:
+#   INSTA_SESSION_BASE64  - base64-encoded instaloader session file
+#   GCP_SA_KEY_JSON       - GCP service account key (JSON) with BigQuery permissions
+
+name: Daily Instagram Scraper
+
+on:
+  schedule:
+    # 06:00 UTC = 03:00 BRT (horario de baixo uso do instagram)
+    - cron: "0 6 * * *"
+
+  # permite rodar manualmente pelo github
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Decode Instagram session file
+        run: |
+          echo "${{ secrets.INSTA_SESSION_BASE64 }}" | base64 -d > session-file
+
+      - name: Setup GCP credentials
+        run: |
+          echo '${{ secrets.GCP_SA_KEY_JSON }}' > gcp-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ github.workspace }}/gcp-key.json" >> $GITHUB_ENV
+
+      - name: Run scraper
+        env:
+          INSTAGRAM_USERNAME: "pelobemdapesquisa"
+          INSTA_SESSION_FILE: "session-file"
+          BQ_PROJECT: "master-research-492307"
+          BQ_DATASET: "instagram_research"
+          BQ_TABLE: "political_posts"
+        run: python scraper/insta_scraper.py
+
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f session-file gcp-key.json
