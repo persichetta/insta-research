@@ -40,7 +40,7 @@ jobs:
           INSTA_SESSION_FILE: "session-file"
           BQ_PROJECT: "master-research-492307"
           BQ_DATASET: "instagram_research"
-          MAX_POSTS_PER_RUN: "15"
+          MAX_POSTS_PER_RUN: "5"
           DELAY_BETWEEN_POSTS: "10"
         run: python insta_comments_scraper.py
 
