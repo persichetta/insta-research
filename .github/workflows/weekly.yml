@@ -1,4 +1,4 @@
-name: Daily Instagram Scraper
+name: Weekly Instagram Scraper
 
 on:
  schedule:
