@@ -31,5 +31,8 @@ if not username:
     print("ERROR: authentication failed. Log into Instagram in Firefox and try again.")
     sys.exit(1)
 
+# Required: set _username so instaloader recognizes the session as valid
+L.context._username = username
+
 L.save_session_to_file(SESSION_FILE)
 print(f"Session saved for '{username}' -> {SESSION_FILE}")
